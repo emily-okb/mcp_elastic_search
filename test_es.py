@@ -3,6 +3,18 @@ import os
 from elasticsearch import Elasticsearch
 from sparse_vec import call_sparse_vec_api
 import asyncio
+from pymongo import MongoClient
+import logging
+
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
 
 
 def create_index(es, index_name, body):
@@ -12,7 +24,7 @@ def create_index(es, index_name, body):
             es.indices.create(index=index_name, body=body)
             print(f"Index '{index_name}' created.")
         except Exception as e:
-            print(f"Error creating index: {e}")
+            logging.error(f"Error creating index: {e}")
     else:
         print(f"Index '{index_name}' already exists.")
 
@@ -29,23 +41,64 @@ def get_text_to_embed(json_data):
     if len(text_to_embed) == 0:
         text_to_embed = name
     return text_to_embed
+    
+
+def get_mongodb_data(connection_string):
+
+    try:
+        client = MongoClient(connection_string)
+    except Exception as e:
+        logging.error(f"Error connecting to MongoDB client: {e}")
+
+    # Select database and collection
+    db = client["mcp"]
+    collection = db["mcp_server"]
+
+    field_ids = ["about", "tools"]
+    projection = {field: 1 for field in field_ids}
+
+    try:
+        results = collection.find({}, projection)
+    except Exception as e:
+        logging.error(f"Error getting MongoDB data: {e}")
+
+    all_data = []
+    all_text_to_embed = []
+
+    for doc in results:
+        mcp_id = doc.get("id", "")
+        name = mcp_id.split("/", 1)[-1]
+        about = doc.get("about", "")
+        tools = doc.get("tools", [])
+
+        data = {"id": mcp_id,
+                "about": about,
+                "tools": tools
+                }
+
+        text_to_embed = about
+        for tool in tools:
+            description = tool.get("description")
+            if description:
+                text_to_embed += " - " + description
+        text_to_embed = text_to_embed.strip()
+        if len(text_to_embed) == 0:
+            text_to_embed = name
+
+        assert validate_mongodb_data(data), "Invalid MongoDB document found"
+        all_data.append(data)
+        all_text_to_embed.append(text_to_embed)
+
+    return all_data, all_text_to_embed
 
 
 def add_docs_to_index(es, index_name, doc_path):
-    all_data = []
-    text_to_embed = []
-    operations_list = []
-    for filename in os.listdir(doc_path):
-        fullpath = os.path.join(doc_path, filename)
-        if os.path.isfile(fullpath) and filename.lower().endswith(".json"):
-            with open(fullpath, 'r') as file:
-                data = json.load(file)
-                text_to_embed.append(get_text_to_embed(data))
-                all_data.append(data)
+
+    all_data, all_text_to_embed = get_mongodb_data(connection_string)
 
     BATCH_SIZE = 1
 
-    embeddings = asyncio.run(call_sparse_vec_api(text_to_embed, BATCH_SIZE))
+    embeddings = asyncio.run(call_sparse_vec_api(all_text_to_embed, BATCH_SIZE))
 
     assert len(embeddings) == len(all_data), "Failed to get all embeddings"
 
@@ -58,10 +111,39 @@ def add_docs_to_index(es, index_name, doc_path):
             }
         })
         operations_list.append(data)
-
+        
     resp = es.bulk(operations=operations_list)
     assert not resp["errors"], "Error adding documents."
     
+
+def validate_mongodb_data(doc):
+    EXPECTED_KEYS = {
+        "id": str,
+        "about": str,
+        "tools": list,
+    }
+    EXPECTED_TOOL_KEYS = {
+        "name": (str, list, type(None)),
+        "description": (str, type(None)),
+        "endpoint": str,
+        "inputs": str,
+        "role": str,
+        "parameters": dict,
+    }
+
+    for key, expected_type in EXPECTED_KEYS.items():
+        if key not in doc or not isinstance(doc[key], expected_type):
+            logging.error(f"Incorrect MongoDB data format at key: {key}")
+            return False
+
+    if "tools" in doc:
+        for item in doc["tools"]:
+            for tools_key in item:
+                if tools_key not in EXPECTED_TOOL_KEYS.keys():
+                    logging.error(f"Incorrect MongoDB data format at key: {tools_key}")
+                    return False
+    
+    return True
 
 
 def validate_doc_format(doc):
@@ -107,12 +189,20 @@ def validate_doc_format(doc):
     return True
 
 
-def test_mcp(es, doc_path, body):
+def delete_index(es, index_name):
+    try:
+        resp = es.indices.delete(index=index_name)
+        assert resp["acknowledged"]
+    except Exception as e:
+        logging.error(f"Failed to delete index: {e}")
+
+
+def test_mcp(es, connection_string, body):
 
     # create test index
     test_index_name = "test-mcp-0"
     create_index(es, test_index_name, body)
-    add_docs_to_index(es, test_index_name, doc_path)
+    add_docs_to_index(es, test_index_name, connection_string)
 
     # test that index can be queried properly
     query_body_0 = {
@@ -161,9 +251,7 @@ def test_mcp(es, doc_path, body):
 
 
     # delete test index
-    resp = es.indices.delete(index=test_index_name)
-    assert resp["acknowledged"], f"Error deleting index"
-
+    delete_index(es, test_index_name)
 
     print("All tests passed.")
 
@@ -175,7 +263,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Elasticsearch Index Builder")
     parser.add_argument("--index_name", type=str, required=False, help="Name of index")
-    parser.add_argument("--doc_path", type=str, required=False, help="Path to document with MCP data")
     parser.add_argument("--run_tests", action="store_true", help="Whether to run tests")
     args = parser.parse_args()
 
@@ -216,17 +303,15 @@ if __name__ == "__main__":
     else:
         print("Connected to Elasticsearch.")
 
-    doc_path = "mcp_data"
-    if args.doc_path:
-        doc_path = args.doc_path
+    connection_string = "mongodb://mongo.web.web:lQ0ecPUy3u871ECbgsMc5IM0ceiYuHyI@web.mongo.nb.com:27017/admin?retryWrites=true&replicaSet=web&readPreference=secondaryPreferred&connectTimeoutMS=10000&authSource=admin"
 
     if args.run_tests:
-        test_mcp(es, doc_path, BODY)
+        test_mcp(es, connection_string, BODY)
 
     else:
         index_name = "test-mcp-1"
-        if args.index_name:
-            index_name = args.index_name
+        if es.indices.exists(index=index_name):
+            delete_index(es, index_name)
         
         create_index(es, index_name, BODY)
-        add_docs_to_index(es, index_name, doc_path)
+        add_docs_to_index(es, index_name, connection_string)
