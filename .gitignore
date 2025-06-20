@@ -1,0 +1,17 @@
+# Ignore Python bytecode and compiled files
+*.pyc
+__pycache__/
+
+# Ignore virtual environment folders and configuration files
+.es_venv/
+lib64/
+pyvenv.cfg
+python/
+python3/
+python3.10/
+
+# Ignore data files
+mcp_data/*
+
+# Ignore system files
+.DS_Store
