@@ -15,3 +15,9 @@ mcp_data/*
 
 # Ignore system files
 .DS_Store
+
+# Ignore log file
+app.log
+
+# Ignore temporary testing file
+temp.py
